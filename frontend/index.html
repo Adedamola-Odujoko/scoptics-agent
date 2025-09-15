@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Scoptics AI Agent</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Helvetica, Arial, sans-serif;
+        background-color: #f4f6f8;
+        color: #333;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+      .container {
+        max-width: 900px;
+        margin: 0 auto;
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        flex-grow: 1;
+        padding: 1rem;
+      }
+      h1 {
+        color: #1a202c;
+        text-align: center;
+        margin-bottom: 1rem;
+      }
+      .chat-container {
+        flex-grow: 1;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        background-color: white;
+        padding: 1rem;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+      .query-box {
+        display: flex;
+        gap: 1rem;
+        margin-top: 1rem;
+      }
+      #query-input {
+        flex-grow: 1;
+        padding: 0.75rem;
+        font-size: 1rem;
+        border: 1px solid #cbd5e0;
+        border-radius: 8px;
+      }
+      #submit-button {
+        padding: 0.75rem 1.5rem;
+        font-size: 1rem;
+        font-weight: bold;
+        background-color: #3b82f6;
+        color: white;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      #submit-button:hover {
+        background-color: #2563eb;
+      }
+      .loader {
+        display: none;
+        text-align: center;
+        color: #666;
+        font-style: italic;
+      }
+      .chat-message {
+        padding: 0.75rem 1rem;
+        border-radius: 8px;
+        max-width: 80%;
+      }
+      .user-message {
+        background-color: #3b82f6;
+        color: white;
+        align-self: flex-end;
+      }
+      .agent-message {
+        background-color: #e2e8f0;
+        color: #1a202c;
+        align-self: flex-start;
+      }
+      .data-card {
+        background-color: #1a202c;
+        color: #f4f6f8;
+        border-radius: 6px;
+        padding: 1rem;
+        margin-top: 0.5rem;
+        font-family: monospace;
+        font-size: 0.8rem;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+      }
+      .error-message {
+        color: #ef4444;
+        font-weight: bold;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Scoptics AI Agent</h1>
+      <div class="chat-container" id="chat-container">
+        <!-- Chat history will be dynamically inserted here -->
+        <div class="chat-message agent-message">
+          Hello! Ask me a question about your match data.
+        </div>
+      </div>
+      <div class="loader" id="loader">Agent is thinking...</div>
+      <div class="query-box">
+        <input
+          type="text"
+          id="query-input"
+          placeholder="e.g., show me the top speed..."
+        />
+        <button id="submit-button">Send</button>
+      </div>
+    </div>
+    <script src="app.js"></script>
+  </body>
+</html>

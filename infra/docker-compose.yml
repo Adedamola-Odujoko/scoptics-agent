@@ -1,0 +1,66 @@
+# Use version 3.8 of the Docker Compose file format, which is modern and stable.
+version: "3.8"
+
+# Define all the services (containers) that make up our application stack.
+services:
+  # --------------------------------------------------------------------------
+  # 1. Our primary database: PostgreSQL with the PostGIS extension
+  #    This will store our raw tracking data and our pre-computed events.
+  # --------------------------------------------------------------------------
+  db:
+    # Use an official image that bundles PostgreSQL 16 with PostGIS 3.4.
+    image: postgis/postgis:16-3.4
+    # Give the container a friendly, predictable name.
+    container_name: scoptics-db
+    # Environment variables to configure the database on first startup.
+    environment:
+      POSTGRES_USER: scoptics_user
+      # NOTE: In a real production system, this password should be a secret!
+      POSTGRES_PASSWORD: scoptics_password
+      POSTGRES_DB: scoptics_db
+    # Port mapping: Connects the container's port 5432 to your Mac's port 5432.
+    # This lets you connect to the database from your local machine with tools like DBeaver or directly from Python.
+    ports:
+      - "5432:5432"
+    # Volume mapping: This is CRITICAL. It links a folder on your Mac (./postgres-data)
+    # to the folder inside the container where Postgres stores its data.
+    # This ensures that your data is saved even if you stop or remove the container.
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    # Healthcheck: Docker will periodically run this command inside the container
+    # to make sure the database is not just running, but is actually ready to accept connections.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scoptics_user -d scoptics_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # 2. Our vector database: Weaviate
+  #    This will store the vector embeddings of our events for semantic search.
+  # --------------------------------------------------------------------------
+  vector_db:
+    # Use a specific version of the official Weaviate image.
+    image: semitechnologies/weaviate:1.24.1
+    container_name: scoptics-vector-db
+    ports:
+      # Port 8080 is for the main REST API (how our Python app will talk to it).
+      - "8080:8080"
+      # Port 50051 is for the gRPC interface, used for high-performance data transfer.
+      - "50051:50051"
+    # Like Postgres, we MUST map a volume to persist the vector data.
+    volumes:
+      - ./weaviate-data:/var/lib/weaviate
+    # Environment variables to configure Weaviate.
+    environment:
+      # Allow anonymous (unauthenticated) access for easy local development.
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      # Tell Weaviate where to store its data inside the container.
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      # Don't enable a default vectorizer module. We will generate the embeddings
+      # ourselves in our Python application, giving us full control.
+      DEFAULT_VECTORIZER_MODULE: "none"
+      # We don't need any other fancy modules for now, keeping it lightweight.
+      ENABLE_MODULES: ""
+      # Set a cluster hostname
+      CLUSTER_HOSTNAME: "node1"
