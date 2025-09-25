@@ -1,62 +1,65 @@
-# Import necessary components from Python's standard libraries and Pydantic.
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-from uuid import UUID  # A universally unique identifier, great for primary keys.
+from uuid import UUID
+from typing import Union # Make sure to add Union to this import line at the top of the file
+from pydantic import field_validator # Make sure to add field_validator to this import
 
 from pydantic import BaseModel, Field
 
 # =============================================================================
-# PYDANTIC DATA CONTRACTS
-# =============================================================================
-# These classes define the expected structure and data types for objects in our
-# application. Pydantic uses these to validate data and provide helpful
-# editor support (like autocompletion).
+# PYDANTIC DATA CONTRACTS (V2 - SKILLCORNER ALIGNED)
 # =============================================================================
 
+# --- Sub-models for nested objects ---
 
-class TrackingRecord(BaseModel):
+class TrackedObject(BaseModel):
     """
-    Represents a single row of data from the raw `tracking` table.
-    This model validates the data upon creation.
+    Represents a single object (player, ball, ref) within a frame.
+    This version is more robust to variations in the source data types.
     """
-    match_id: str
-    frame: int
-    timestamp_iso: datetime  # Pydantic will automatically parse ISO strings into datetime objects.
-    
-    # `Optional` means this field can be `None`. This is useful for the ball,
-    # which has no team_id or player_id. `None` is the default value.
-    team_id: Optional[str] = None
-    player_id: Optional[str] = None
-    
+    track_id: int
+    # Allow the source data to be a string, an integer, or None.
+    trackable_object: Optional[Union[str, int]] = None
+    group_name: Optional[str] = None
     x: float
     y: float
-    z: float
-    speed: Optional[float] = None
-    orientation: Optional[float] = None
+    z: Optional[float] = None
 
+    # This is a Pydantic validator. It runs after the initial data is read
+    # and ensures the final `trackable_object` is always a string.
+    @field_validator('trackable_object', mode='before')
+    @classmethod
+    def convert_trackable_object_to_str(cls, v):
+        if v is not None:
+            return str(v)
+        return v
 
-class Event(BaseModel):
+class Possession(BaseModel):
+    """Represents the possession data for a frame."""
+    trackable_object: str
+    group: str
+
+# --- Main Table Models ---
+
+class TrackingFrame(BaseModel):
     """
-    Represents a single row from the pre-computed `events` table.
+    Represents a single row in our new `tracking_data` table.
     """
-    # `Field(default_factory=uuid.uuid4)` is a common pattern to generate a new
-    # unique ID for every new event we create.
-    event_id: UUID
     match_id: str
-    event_type: str
-    
-    start_time: datetime
-    end_time: datetime
-    start_frame: int
-    end_frame: int
-    
-    team_id: Optional[str] = None
-    
-    # For JSONB fields, we can use standard Python types like List or Dict.
-    # `List[str]` means we expect a list of strings, e.g., ["player1", "player7"].
-    players_involved: List[str]
-    
-    # `Dict[str, Any]` is a flexible way to handle a JSON object where we might
-    # not know all the keys in advance. It's a dictionary with string keys and
-    # any type of value.
-    metadata_json: Dict[str, Any]
+    period: int
+    frame: int
+    timestamp_iso: datetime
+    tracked_objects: List[TrackedObject]
+    frame_metadata: Optional[Dict[str, Any]] = None
+
+class MatchMetadata(BaseModel):
+    """
+    Represents a single row in our `match_metadata` table.
+    """
+    match_id: str
+    competition_name: Optional[str] = None
+    home_team_name: Optional[str] = None
+    away_team_name: Optional[str] = None
+    pitch_length_m: Optional[float] = None
+    pitch_width_m: Optional[float] = None
+    additional_info: Optional[Dict[str, Any]] = None

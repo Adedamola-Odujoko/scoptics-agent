@@ -56,27 +56,27 @@ class DynamicSqlArgs(BaseModel):
 
 def run_dynamic_query(args: DynamicSqlArgs):
     """
-    Use this SUPER-TOOL ONLY when no other tool can answer the user's question.
-    This is for advanced, dynamic analysis. Formulate a single, read-only
-    PostgreSQL SELECT query to find the answer. The query will be run against the
-    'tracking' table which contains all raw frame-by-frame data. Do NOT use this tool
-    for simple requests that can be handled by other tools.
+    Use this SUPER-TOOL to answer any question any other tool cannot answer.
+    This is for advanced, dynamic analysis. Formulate a read-only
+    PostgreSQL SELECT query to find the answer. you should always reason, plan and solve.
 
-    The 'tracking' table schema is:
-    - match_id (TEXT)
-    - frame (INTEGER)
-    - timestamp_iso (TIMESTAMPTZ)
-    - team_id (TEXT)
-    - player_id (TEXT)
-    - x (DOUBLE PRECISION)
-    - y (DOUBLE PRECISION)
-    - z (DOUBLE PRECISION)
-    - speed (DOUBLE PRECISION)
-    - orientation (DOUBLE PRECISION)
+    You have access to two tables:
+    1. 'match_metadata': Use this for questions about a match, like teams, competition, player names or pitch dimensions.
+       Schema: (match_id TEXT, competition_name TEXT, home_team_name TEXT, away_team_name TEXT, pitch_length_m FLOAT, pitch_width_m FLOAT)
+
+    2. 'tracking_data': Use this for all questions about player/ball positions, speed, or events over time.
+       The 'tracked_objects' column is a JSON array containing every player and the ball.
+       Schema: (match_id TEXT, period INT, frame INT, timestamp_iso TIMESTAMPTZ, tracked_objects JSONB, frame_metadata JSONB)
+       
+       Inside 'tracked_objects': [{"track_id": int, "trackable_object": str, "group_name": str, "x": float, "y": float, "z": float}, ...]
+       Inside 'frame_metadata': {"possession": {"trackable_object": str, "group": str}}
     
-    IMPORTANT: For any query that describes a situation over time (like "defenders
-    are in a flat line" or "ball is in the box"), you MUST select the `frame`,
-    `timestamp_iso`, and `match_id` columns, as they are needed for clustering.
+    IMPORTANT RULES FOR SQL:
+    - The `match_id` column is TEXT and its value MUST be enclosed in single quotes, e.g., WHERE match_id = '4039'.
+    - The `possession` group name in `frame_metadata` is either 'home team' or 'away team'.
+    - For any query that describes a situation over time, you MUST select the `frame`,
+      `timestamp_iso`, and `match_id` columns, as they are needed for clustering.
+
     For simple aggregations like "fastest moment", you can select fewer columns.
     """
     print(f"TOOL EXECUTED: run_dynamic_query with SQL: '{args.sql_query}'")

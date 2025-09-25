@@ -1,2 +1,19 @@
 .env
 .env
+# macOS specific files
+.DS_Store
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# IDE-specific settings (good practice to add)
+.vscode/
+.idea/
+
+# Docker data volumes - NEVER commit live database files
+infra/postgres-data/
+infra/weaviate-data/
+
+# Poetry files
+.venv/
