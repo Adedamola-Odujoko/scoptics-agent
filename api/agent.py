@@ -165,12 +165,16 @@ Otherwise, if you need to query the database, create a full plan like this:
     {"step_number": 1, "description": "A short description of what this step calculates.", "cte_name": "Step1CTE"}
   ],
   "final_select_details": {
-    "columns": ["col1", "col2"],
-    "order_by": {"column": "col1", "direction": "ASC"},
-    "limit": 3
+    "columns": [
+      {"column_name": "possessing_team", "alias": "Team in Possession"},
+      "avg_vertical_compactness"
+    ],
+    "order_by": {"column": "possessing_team", "direction": "ASC"},
+    "limit": 10
   }
 }
 ```
+CRITICAL RULE FOR FINAL OUTPUT: The columns list in final_select_details MUST contain either simple strings (like "avg_vertical_compactness") or JSON objects. If it is an object, it MUST use the key "column_name" for the original column and can optionally use "alias". The order_by object MUST use the key "column". Strictly adhere to this format.
 """
 
 CHIEF_ANALYST_PROMPT = """
@@ -272,6 +276,48 @@ function round(double precision, integer) does not exist: Fix by casting the val
 invalid reference to FROM-clause entry: Fix by using explicit JOIN syntax (CROSS JOIN LATERAL).
 - **`operator does not exist: typeA = typeB`**: This is a data type mismatch. The most common cause is an incorrect cast (`::INT`, `::NUMERIC`). The fix is usually to **remove the cast** or **cast both sides of the comparison to the same type** (e.g., `CAST(column_a AS TEXT) = CAST(column_b AS TEXT)`).
 Your output must be ONLY the corrected SQL query wrapped in sql ... .
+"""
+
+PLAUSIBILITY_CHECKER_PROMPT = """
+You are a Senior Football Analyst acting as a sanity checker. You have been given the user's original question and the data returned from a database query. Your only job is to determine if the data is plausible based on your expert knowledge of football.
+
+**Commonsense Rules for Professional Football Data:**
+1.  **Symmetry:** Events like passes, shots, or tackles should occur on both the left and right sides of the pitch over a full match. A result of 100% on one side and 0% on the other is almost always an error.
+2.  **Physical Limits:** Player speeds rarely exceed 10.5 m/s (38 km/h). Ball speeds rarely exceed 35 m/s (126 km/h).
+3.  **Game State:** A team cannot have 0% possession. The total number of passes in a match is typically between 600 and 1200.
+4.  **Coordinates:** Pitch coordinates should be both positive and negative if (0,0) is the center spot. For a 105x68m pitch, X should be between -52.5 and 52.5, and Y should be between -34 and 34. A range that is exclusively positive or negative suggests a data anomaly.
+
+Review the query and the data. Output a single JSON object.
+
+**JSON Output Structure:**
+{
+  "is_plausible": <boolean>,
+  "reason": "<If false, a brief explanation of why the data is implausible (e.g., 'Data shows 100% of passes from one wing, which is physically unrealistic.').>",
+  "hypothesized_cause": "<If false, your best guess for the data error (e.g., 'Y-coordinates may have been recorded as absolute values, losing the distinction between left and right.').>"
+}
+"""
+
+QUERY_ADAPTER_PROMPT = """
+You are an expert PostgreSQL DBA and data analyst. Your goal is to fix a flawed analytical query.
+You have been given:
+1. The original User Query.
+2. The initial SQL query that produced a correct but implausible result.
+3. The reason the result was implausible and the hypothesized cause.
+
+Your task is to first write a simple **diagnostic SQL query** to confirm the hypothesized cause. Then, based on that logic, you will write a **new, adapted analytical query** that accounts for the data anomaly.
+
+**Example Scenario:**
+- **Implausible Reason:** "Data shows 100% of passes from one wing."
+- **Hypothesized Cause:** "Y-coordinates may have been recorded as absolute values."
+- **Your Logic:** "My diagnostic query should check the MIN and MAX of the y-coordinates to confirm they are all positive. If they are, my adapted query must redefine the 'left' and 'right' wings based on the observed data range (e.g., left is the lower half of the range, right is the upper half) instead of the theoretical pitch dimensions."
+
+Output a single JSON object.
+
+**JSON Output Structure:**
+{
+  "diagnostic_sql": "<A simple query to investigate the data's underlying properties, e.g., 'SELECT MIN(start_y), MAX(start_y) FROM passes WHERE match_id = '4039';'>",
+  "adapted_query": "<The complete, corrected version of the initial analytical query that will produce a more plausible result.>"
+}
 """
 
 FINAL_SYNTHESIS_PROMPT = """
@@ -404,19 +450,52 @@ def run_conversational_agent(user_query: str, chat_history: List[Dict], last_dat
             full_cte_query += ",\n"
         full_cte_query += cte_sql
 
-    try:
-        columns_list = final_select_details['columns']
-        select_cols = ", ".join([col['column_name'] if isinstance(col, dict) else col for col in columns_list])
-        order_by_info = final_select_details.get('order_by') or {}
-        order_by_clause = f"ORDER BY {order_by_info['column']} {order_by_info['direction']}" if 'column' in order_by_info else ""
-        limit = final_select_details.get('limit')
-        limit_clause = f"LIMIT {limit}" if limit is not None else ""
-        last_cte_name = steps[-1]['cte_name']
-        final_select_sql = f"SELECT {select_cols} FROM {last_cte_name} {order_by_clause} {limit_clause};"
-        final_query = f"{full_cte_query}\n{final_select_sql}"
-    except (KeyError, IndexError, TypeError) as e:
-        return {"conversational_response": f"I'm sorry, my plan was incomplete and I could not build the final query. Error: {e}", "data": None, "updated_history": chat_history}
+    # --- THIS IS THE NEW, ROBUST CODE ---
+        try:
+            columns_list = final_select_details['columns']
+            
+            # More robustly parse the columns list
+            formatted_columns = []
+            for col in columns_list:
+                if isinstance(col, str):
+                    formatted_columns.append(col)
+                elif isinstance(col, dict):
+                    # The LLM might use 'column_name' or just 'column'. We'll accept both.
+                    column_name = col.get('column_name') or col.get('column')
+                    alias = col.get('alias')
+                    if column_name and alias:
+                        # Use quotes around alias for safety with special characters/keywords
+                        formatted_columns.append(f'{column_name} AS "{alias}"')
+                    elif column_name:
+                        formatted_columns.append(column_name)
+            
+            if not formatted_columns:
+                raise ValueError("Could not parse any columns from the plan.")
+                
+            select_cols = ", ".join(formatted_columns)
+            
+            # More robustly parse the order_by clause
+            order_by_clause = ""
+            order_by_info = final_select_details.get('order_by')
+            if order_by_info and isinstance(order_by_info, dict):
+                # Accept 'column' or 'column_name'
+                order_col = order_by_info.get('column') or order_by_info.get('column_name')
+                order_dir = order_by_info.get('direction', 'ASC')
+                if order_col:
+                    order_by_clause = f"ORDER BY {order_col} {order_dir}"
 
+            limit = final_select_details.get('limit')
+            limit_clause = f"LIMIT {limit}" if limit is not None else ""
+            
+            # Ensure there are steps before trying to access the last one
+            if not steps:
+                raise ValueError("Plan has no steps, cannot select from a CTE.")
+            last_cte_name = steps[-1]['cte_name']
+            
+            final_select_sql = f"SELECT {select_cols} FROM {last_cte_name} {order_by_clause} {limit_clause};"
+            final_query = f"{full_cte_query}\n{final_select_sql}"
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            return {"conversational_response": f"I'm sorry, my plan was incomplete and I could not build the final query. Error: {e}", "data": None, "updated_history": chat_history}
 
     # STAGE 3: VALIDATION, CORRECTION, AND EXECUTION LOOP
     MAX_ATTEMPTS = 3
@@ -485,6 +564,50 @@ def run_conversational_agent(user_query: str, chat_history: List[Dict], last_dat
             print("AGENT: Clustering results...")
             final_result_for_user = cluster_frames_into_events(tool_result, max_frame_gap=10)
 
+    # --- NEW: PLAUSIBILITY-DIAGNOSIS-ADAPTATION LOOP ---
+    synthesis_notes = "" # Will store notes about self-correction for the final model
+    
+    # 1. Plausibility Check
+    print("AGENT: Submitting results to Plausibility Checker...")
+    plausibility_prompt = f"{PLAUSIBILITY_CHECKER_PROMPT}\n\n**User Query:** '{user_query}'\n\n**Query Result Data:**\n{json.dumps(sanitize_for_json(tool_result[:5]), indent=2)}" # Preview data
+    plausibility_response = main_model.generate_content(plausibility_prompt)
+    
+    try:
+        plausibility_text_match = re.search(r"```(?:json)?\n(.*?)```", plausibility_response.text, re.DOTALL)
+        plausibility_result = json.loads(plausibility_text_match.group(1))
+
+        if not plausibility_result.get("is_plausible"):
+            print(f"AGENT WARNING: Plausibility check failed. Reason: {plausibility_result.get('reason')}")
+            synthesis_notes += f"Initial analysis produced an implausible result: {plausibility_result.get('reason')}. The agent initiated a self-correction protocol. "
+
+            # 2. Diagnosis and Adaptation
+            print("AGENT: Initiating self-correction protocol...")
+            adapter_prompt = f"{QUERY_ADAPTER_PROMPT}\n\n**User Query:** '{user_query}'\n\n**Initial Flawed SQL:**\n```sql\n{final_query}\n```\n\n**Implausibility Reason:** {plausibility_result.get('reason')}\n**Hypothesized Cause:** {plausibility_result.get('hypothesized_cause')}"
+            adapter_response = main_model.generate_content(adapter_prompt)
+            
+            adapter_text_match = re.search(r"```(?:json)?\n(.*?)```", adapter_response.text, re.DOTALL)
+            adapter_result = json.loads(adapter_text_match.group(1))
+            
+            diagnostic_sql = adapter_result.get("diagnostic_sql")
+            adapted_query = adapter_result.get("adapted_query")
+
+            if diagnostic_sql and adapted_query:
+                # 3. Re-Execution
+                print(f"AGENT: Executing diagnostic query: {diagnostic_sql}")
+                diagnostic_data = execute_dynamic_sql_query(diagnostic_sql)
+                synthesis_notes += f"A diagnostic query was run, revealing the underlying data issue: {json.dumps(diagnostic_data)}. "
+                
+                print("AGENT: Executing adapted analytical query...")
+                final_query = adapted_query # Overwrite the flawed query with the new one
+                tool_result = execute_dynamic_sql_query(final_query) # Overwrite the flawed result
+                synthesis_notes += "The original query was adapted to account for this, and the analysis was re-run. "
+            else:
+                print("AGENT WARNING: Self-correction failed to produce a new query.")
+                synthesis_notes += "The agent was unable to automatically correct the query. The following results are based on the initial, likely flawed, data. "
+
+    except (Exception) as e:
+        print(f"AGENT WARNING: Plausibility check or adaptation loop failed: {e}")
+
     # STAGE 5: SUMMARIZATION & CONFIDENCE SCORING
     chat_model = genai.GenerativeModel(model_name="gemini-2.5-pro")
     chat_session = chat_model.start_chat(history=chat_history)
@@ -492,7 +615,8 @@ def run_conversational_agent(user_query: str, chat_history: List[Dict], last_dat
     synthesis_context = (f"Here is the context for my analysis:\n"
                          f"1. User's Original Query: '{user_query}'\n"
                          f"2. Final Executed SQL: ```sql\n{final_query}\n```\n"
-                         f"3. Raw Data Result: {json.dumps(sanitized_result)}\n\n"
+                         f"3. Important Context from Analysis: {synthesis_notes}\n"
+                         f"4. Raw Data Result: {json.dumps(sanitized_result)}\n\n"
                          f"Please perform your final review and synthesis based on these inputs.")
     synthesis_prompt = f"{FINAL_SYNTHESIS_PROMPT}\n\n{synthesis_context}"
     synthesis_response = chat_session.send_message(synthesis_prompt)
