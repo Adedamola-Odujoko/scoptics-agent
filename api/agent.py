@@ -59,6 +59,44 @@ def serialize_history(chat_history: list) -> List[Dict]:
         serialized.append({'role': role, 'parts': parts_list})
     return serialized
 
+def format_history_for_prompt(chat_history: List[Dict]) -> str:
+    """Formats the chat history into a readable string for the LLM prompt."""
+    if not chat_history:
+        return ""
+    
+    # Start with a clear header for the LLM
+    formatted_history = "\n\n**PREVIOUS CONVERSATION HISTORY (for context):**\n---\n"
+    
+    for message in chat_history:
+        # Determine the role and clean up the parts for prompting
+        role = "User" if message.get('role') == 'user' else "Agent"
+        parts_list = message.get('parts', [])
+        
+        # We only care about the natural language part of the history for context
+        text_content = " ".join(str(p) for p in parts_list if isinstance(p, str) and not p.startswith("Tool Call:"))
+        
+        if text_content.strip():
+            formatted_history += f"{role}: {text_content.strip()}\n"
+            
+    formatted_history += "---\n"
+    return formatted_history
+
+def format_data_for_prompt(last_data: List[Dict] = None) -> str:
+    """Formats the last returned data into a context block for the LLM."""
+    if not last_data:
+        return ""
+    
+    # We'll just show the first few records to keep the prompt concise
+    preview = json.dumps(last_data[:3], indent=2)
+    
+    context_str = (
+        "\n\n**DATA FROM PREVIOUS TURN (available for use):**\n---\n"
+        f"The last query returned {len(last_data)} records. Here is a preview:\n"
+        f"```json\n{preview}\n```\n"
+        "---\n"
+    )
+    return context_str
+
 
 # --- The Agent's "Brain": The Single Source of Truth ---
 DB_SCHEMA_AND_ANALYTICAL_CONVENTIONS = """
@@ -67,30 +105,44 @@ DB_SCHEMA_AND_ANALYTICAL_CONVENTIONS = """
 This is the definitive guide to the database. All generated SQL MUST strictly adhere to these rules.
 
 **--- STRATEGY: PRIORITIZE EVENT TABLES ---**
-Your primary strategy is to answer questions using the high-level Event Tables (`possession_spells`, `shots`, `frame_spatial_metrics`) whenever possible. These tables are fast and contain pre-calculated, robust data. Only fall back to querying the raw `tracking_data` table for questions that cannot be answered by the event tables.
+Your primary strategy is to answer questions using the high-level Event Tables whenever possible. These tables are fast and contain pre-calculated, robust data. Only fall back to querying the raw `tracking_data` table for questions that absolutely cannot be answered by the event tables.
 
-**1. High-Level Event Tables ("Silver" Layer)**
-- `possession_spells`: (match_id, spell_id, period, start_frame, end_frame, start_time, duration_seconds, possessing_team, possessing_player_id)
-- `shots`: (shot_id, match_id, period, frame, shooter_id, shooter_team, start_x, start_y, outcome, xg)
-- `frame_spatial_metrics`: (match_id, period, frame, home_team_compactness, away_team_compactness)
+**1. High-Level Event Tables ("Silver" Layer) - USE THESE FIRST!**
+- `possession_spells`: (match_id TEXT, spell_id TEXT, period INT, start_frame INT, end_frame INT, start_timestamp TIMESTAMPTZ, end_timestamp TIMESTAMPTZ, duration_seconds FLOAT, possessing_team TEXT, possessing_player_id TEXT)
+    - Use for questions about possession time, number of spells, etc.
+- `passes`: (pass_id TEXT, match_id TEXT, period INT, start_frame INT, end_frame INT, start_timestamp TIMESTAMPTZ, end_timestamp TIMESTAMPTZ, passer_id TEXT, receiver_id TEXT, passer_team TEXT, start_x FLOAT, start_y FLOAT, end_x FLOAT, end_y FLOAT, distance_m FLOAT, outcome TEXT)
+    - **Note:** This table contains the full context of a pass. Use `start_x` for the passer's location and `end_x` for the receiver's location to determine if a pass crossed a line.
+- `shots`: (shot_id TEXT, match_id TEXT, period INT, frame INT, "timestamp" TIMESTAMT كارZ, game_minute INT, game_second INT, shooter_id TEXT, shooter_team TEXT, start_x FLOAT, start_y FLOAT, outcome TEXT, xg FLOAT)
+    - Use for anything related to shots, shot locations, outcomes (Blocked Shot), and expected goals (xg).
+- `big_chances`: (big_chance_id TEXT, match_id TEXT, period INT, frame INT, "timestamp" TIMESTAMPTZ, player_id TEXT, team_name TEXT, x FLOAT, y FLOAT, num_defenders_between INT)
+    - Use to identify high-quality scoring opportunities as defined by the system.
 
-**2. Core Data Tables ("Bronze" Layer)**
-- `match_metadata`: (match_id, competition_name, home_team_name, away_team_name, pitch_length_m, pitch_width_m)
-- `tracking_data`: (match_id, period, frame, timestamp_iso, tracked_objects JSONB, frame_metadata JSONB)
-- `players`: (match_id, trackable_object, first_name, last_name, "number" INT, player_role)
+**2. Core Data Tables **
+- `match_metadata`: (match_id TEXT, competition_name TEXT, home_team_name TEXT, away_team_name TEXT, pitch_length_m FLOAT, pitch_width_m FLOAT)
+- `tracking_data`: (match_id TEXT, period INT, frame INT, timestamp_iso TIMESTAMPTZ, tracked_objects JSONB, frame_metadata JSONB)
+- `players`: (match_id TEXT, trackable_object TEXT, team_id INTEGER, team_name TEXT, first_name TEXT, last_name TEXT, "number" INT, player_role TEXT)
+    - **Note:** This table is the definitive source for linking a player to a team via the `team_name` column.
+- To find the ball in tracked_objects, you must find the trackable_object ID that is not present in the players table for that match.
+
+
 
 **3. CRITICAL ANALYTICAL RULES & BEST PRACTICES**
 - **Rule 0: Prioritize Event Tables:** Before planning a complex query on `tracking_data`, first check if the question can be answered with a simple `SELECT` from the event tables.
-- **Rule 1: Finding the Match Half:** ALWAYS use the dedicated top-level `period` column.
-- **Rule 2: Identifying Players (Raw Data):** In `tracking_data`, a player is an object where `(p.obj ->> 'group_name') IS NOT NULL`.
-- **Rule 3: Identifying Outfield Players (Raw Data):** Exclude the goalkeeper using `(p.obj ->> 'trackable_object') <> '1'`.
-- **Rule 4: SQL Join Syntax:** MUST use explicit `JOIN` keywords. For `LATERAL`, use `CROSS JOIN LATERAL`.
-- **Rule 5: Getting Player Names:** `JOIN` the `players` table using `trackable_object` as the key.
-- **Rule 6: Calculating Durations (Raw Data):** MUST use `timestamp_iso`. Do NOT rely on frame counts.
-- **Rule 7: Rounding in PostgreSQL:** MUST cast values to `NUMERIC` before using `ROUND`.
-- **Rule 8: Sprint Speed Filter (Raw Data):** Filter out unrealistic speeds (`WHERE speed_mps < 13.0`).
+- **Rule 1: The Universal Identifier:** The `trackable_object` column is the key to identify any entity. The IDs in the event tables (`shooter_id`, `passer_id`, etc.) all correspond to `trackable_object`. The `trackable_object` column (type TEXT) is the key to identify any entity. The ID columns in the event tables (`shooter_id`, `passer_id`, `receiver_id`, etc.) are all TEXT and correspond to `trackable_object`.
+- **Rule 2: Type Casting:** Pay close attention to data types. IDs are TEXT and should be compared with other TEXT values. When unpacking from JSON, the `->>` operator returns TEXT. Do NOT cast these IDs to INT.
+- **Rule 3: Using Timestamps:** The event tables now have dedicated timestamp columns (`timestamp`, `start_timestamp`, `end_timestamp`). Use these directly. Do not join back to `tracking_data` just to get a time.
+- **Rule 4: Finding the Match Half:** ALWAYS use the dedicated top-level `period` column.
+- **Rule 5: SQL Join Syntax:** MUST use explicit `JOIN` keywords. For `LATERAL`, use `CROSS JOIN LATERAL`.
+- **Rule 6: Getting Player Names:** `JOIN` the `players` table using `players.trackable_object` as the key.
+- **Rule 7: Calculating Durations (Raw Data):** If you must use raw data, use `timestamp_iso`. Do NOT rely on frame counts.
+- **Rule 8: Rounding in PostgreSQL:** MUST cast values to `NUMERIC` before using `ROUND`.
 - **Rule 9: No Nested Window Functions:** Use a two-step CTE process if a window function result needs further calculation.
-- **Rule 10: Possession (Raw Data):** To find the possessing team, get the `trackable_object` from `frame_metadata -> 'possession'` and look up its `group_name` in the `tracked_objects` array for that frame.
+- **Rule 10: Identifying the Ball (Raw Data):** The ball does NOT have a 'group_name' and is not in the `players` table. In the `tracking_data`'s `tracked_objects` JSON, you must identify the ball by finding the `trackable_object` that does NOT appear in the `players` table for that `match_id`.
+- **Rule 11: Handling Player Roles:** Player roles can be very specific. If a search for an exact role like 'Central Defender' fails, a good fallback strategy is to use a `LIKE` clause to find related roles, for example: `WHERE player_role LIKE '%Centre Back%'` or `WHERE player_role LIKE '%Defender%'`.
+- **Rule 12: Identifying a Player's Team:** To find a player's team, you MUST query the `players` table. Do NOT use heuristics like joining through the `possession_spells` table.
+- **Rule 13: Provide Timestamps in responses when required for Best practice.
+- **Rule 14: Team Name Aliases:** Team names are stored as their full official names (e.g., 'Manchester City', 'Liverpool Football Club'). Be prepared to map common short names like 'Man City' or 'Liverpool' to their full names in your WHERE clauses.
+- **Rule 15: Pass Outcomes:** The `outcome` column in the `passes` table currently only contains one possible value: 'Completed'.
 """
 
 # --- Agent Prompts ---
@@ -98,6 +150,14 @@ Your primary strategy is to answer questions using the high-level Event Tables (
 ANALYST_CONSTITUTION_PROMPT = """
 You are ScopticsAI, a world-class football tactical analyst. Your primary purpose is to answer complex questions by creating a complete analytical plan.
 Your plan MUST be a single JSON object. You MUST follow all rules in the SCHEMA and CONVENTIONS document.
+**CRITICAL RULE:** If the "Current User Query" can be answered DIRECTLY from the "DATA FROM PREVIOUS TURN", your plan should be to do nothing. In this case, and only this case, your entire plan MUST be:
+```json
+{
+  "explanation": "The answer is available in the data from the previous turn.",
+  "steps": [],
+  "final_select_details": { "action": "NO_OP" }
+}
+Otherwise, if you need to query the database, create a full plan like this:
 ```json
 {
   "explanation": "A brief, one-sentence explanation of your overall plan.",
@@ -121,6 +181,7 @@ You are reviewing a plan from a junior analyst. Your goal is to catch major, obv
 - **Pragmatism over Perfection:** The plan does not need to be the absolute most optimal query in the world. It just needs to be logically sound and directly answer the user's question according to the Conventions Document.
 - **Trust the Rules:** If a plan clearly follows the rules in the Conventions Document (e.g., it uses `timestamp_iso` for durations, it uses the `period` column for halves), you should approve it.
 - **Simple is Good:** If the user's request is simple and the plan is simple and direct, approve it. Do not over-complicate the review.
+- **Clarify Ambiguity:** If the user's request is vague (e.g., "show more," "any player"), the plan should prioritize asking a clarifying question rather than making a single, strong assumption.
 
 **Your Task:**
 Review the plan for MAJOR logical flaws. If a major flaw exists (like using frame counts instead of timestamps for a duration calculation), reject it. Otherwise, approve it.
@@ -139,7 +200,7 @@ You are a Senior PostgreSQL Database Administrator. Your only job is to validate
 Your analysis must be strict. Your output MUST be a single JSON object.
 
 **Rules to Enforce:**
-1.  **Table Names:** The ONLY valid base tables are `match_metadata`, `tracking_data`, `players`, `possession_spells`, `shots`, and `frame_spatial_metrics`. No other table names are allowed in a `FROM` or `JOIN` clause unless they are a Common Table Expression (CTE) defined within the query itself.
+1.  **Table Names:** The ONLY valid base tables are in the schema below. No other table names are allowed in a `FROM` or `JOIN` clause unless they are a Common Table Expression (CTE) defined within the query itself.
 2.  **Column Names:** All column names used must exist in the table schemas provided below.
 3.  **JSON Structure:** The `tracked_objects` JSONB array in the `tracking_data` table MUST be unpacked using `LATERAL jsonb_array_elements()`.
 4.  **SQL Join Syntax:** Do not mix comma-style joins (e.g., `FROM table_a, table_b`) with the `JOIN` keyword. For `LATERAL` unnesting, the required syntax is `CROSS JOIN LATERAL`.
@@ -147,14 +208,21 @@ Your analysis must be strict. Your output MUST be a single JSON object.
 6.  **Quotes:** `match_id` is TEXT and must be in single quotes in `WHERE` clauses (e.g., `match_id = '4039'`).
 
 **Schemas:**
-- **Event Tables (High-Level):**
-  - `possession_spells`: (match_id, spell_id, period, start_frame, end_frame, start_time, duration_seconds, possessing_team, possessing_player_id)
-  - `shots`: (shot_id, match_id, period, frame, shooter_id, shooter_team, start_x, start_y, outcome, xg)
-  - `frame_spatial_metrics`: (match_id, period, frame, home_team_compactness, away_team_compactness)
-- **Core Data Tables (Low-Level):**
-  - `match_metadata`: (match_id, competition_name, home_team_name, away_team_name, pitch_length_m, pitch_width_m)
-  - `players`: (match_id, trackable_object, first_name, last_name, "number" INT, player_role TEXT)
-  - `tracking_data`: (match_id, period, frame, timestamp_iso TIMESTAMPTZ, tracked_objects JSONB, frame_metadata JSONB)
+**1. High-Level Event Tables ("Silver" Layer) - USE THESE FIRST!**
+- `possession_spells`: (match_id TEXT, spell_id TEXT, period INT, start_frame INT, end_frame INT, start_timestamp TIMESTAMPTZ, end_timestamp TIMESTAMPTZ, duration_seconds FLOAT, possessing_team TEXT, possessing_player_id TEXT)
+    - Use for questions about possession time, number of spells, etc.
+- `passes`: (pass_id TEXT, match_id TEXT, period INT, start_frame INT, end_frame INT, start_timestamp TIMESTAMPTZ, end_timestamp TIMESTAMPTZ, passer_id TEXT, receiver_id TEXT, passer_team TEXT, start_x FLOAT, start_y FLOAT, end_x FLOAT, end_y FLOAT, distance_m FLOAT, outcome TEXT)
+    - **Note:** This table contains the full context of a pass. Use `start_x` for the passer's location and `end_x` for the receiver's location to determine if a pass crossed a line.
+- `shots`: (shot_id TEXT, match_id TEXT, period INT, frame INT, "timestamp" TIMESTAMT كارZ, game_minute INT, game_second INT, shooter_id TEXT, shooter_team TEXT, start_x FLOAT, start_y FLOAT, outcome TEXT, xg FLOAT)
+    - Use for anything related to shots, shot locations, outcomes (Blocked Shot), and expected goals (xg).
+- `big_chances`: (big_chance_id TEXT, match_id TEXT, period INT, frame INT, "timestamp" TIMESTAMPTZ, player_id TEXT, team_name TEXT, x FLOAT, y FLOAT, num_defenders_between INT)
+    - Use to identify high-quality scoring opportunities as defined by the system.
+
+**2. Core Data Tables **
+- `match_metadata`: (match_id TEXT, competition_name TEXT, home_team_name TEXT, away_team_name TEXT, pitch_length_m FLOAT, pitch_width_m FLOAT)
+- `tracking_data`: (match_id TEXT, period INT, frame INT, timestamp_iso TIMESTAMPTZ, tracked_objects JSONB, frame_metadata JSONB)
+- `players`: (match_id TEXT, trackable_object TEXT, team_id INTEGER, team_name TEXT, first_name TEXT, last_name TEXT, "number" INT, player_role TEXT)
+    - **Note:** This table is the definitive source for linking a player to a team via the `team_name` column.
 
 Your output MUST be a single JSON object with the following structure:
 ```json
@@ -169,12 +237,28 @@ You are an expert Senior PostgreSQL DBA. Your only task is to fix a broken SQL q
 Your primary goal is to return a single, valid, corrected SQL query. Do not add any explanation or commentary.
 
 **Your "Cheat Sheet" of Rules to Fix Common Errors:**
-- **Valid Tables:** The only tables you can query directly are `match_metadata`, `tracking_data`, `players`, `possession_spells`, `shots`, and `frame_spatial_metrics`. If the error is "Invalid table," fix the query to use one of these.
+- **Valid Tables:** The only tables you can query directly are in the schema below. If the error is "Invalid table," fix the query to use one of these.
 - **Strategy:** If a query is overly complex on `tracking_data`, consider if it can be simplified by using one of the high-level event tables (`shots`, `possession_spells`, etc.).
 - **Getting Player Names:** To get a player's name, you MUST `JOIN` the `players` table.
 - **Unpacking JSON:** Always use `CROSS JOIN LATERAL jsonb_array_elements(...)`.
 - **Nested Window Functions:** This is illegal. If you see this error, you MUST fix it by using a two-step CTE process (calculate the inner function in one CTE, then use that result in the next).
 - **Rounding in PostgreSQL:** The `ROUND` function requires a `NUMERIC` cast. The correct syntax is `ROUND(CAST(value AS NUMERIC), 2)`.
+
+**1. High-Level Event Tables ("Silver" Layer) - USE THESE FIRST!**
+- `possession_spells`: (match_id TEXT, spell_id TEXT, period INT, start_frame INT, end_frame INT, start_timestamp TIMESTAMPTZ, end_timestamp TIMESTAMPTZ, duration_seconds FLOAT, possessing_team TEXT, possessing_player_id TEXT)
+    - Use for questions about possession time, number of spells, etc.
+- `passes`: (pass_id TEXT, match_id TEXT, period INT, start_frame INT, end_frame INT, start_timestamp TIMESTAMPTZ, end_timestamp TIMESTAMPTZ, passer_id TEXT, receiver_id TEXT, passer_team TEXT, start_x FLOAT, start_y FLOAT, end_x FLOAT, end_y FLOAT, distance_m FLOAT, outcome TEXT)
+    - **Note:** This table contains the full context of a pass. Use `start_x` for the passer's location and `end_x` for the receiver's location to determine if a pass crossed a line.
+- `shots`: (shot_id TEXT, match_id TEXT, period INT, frame INT, "timestamp" TIMESTAMT كارZ, game_minute INT, game_second INT, shooter_id TEXT, shooter_team TEXT, start_x FLOAT, start_y FLOAT, outcome TEXT, xg FLOAT)
+    - Use for anything related to shots, shot locations, outcomes (Blocked Shot), and expected goals (xg).
+- `big_chances`: (big_chance_id TEXT, match_id TEXT, period INT, frame INT, "timestamp" TIMESTAMPTZ, player_id TEXT, team_name TEXT, x FLOAT, y FLOAT, num_defenders_between INT)
+    - Use to identify high-quality scoring opportunities as defined by the system.
+
+**2. Core Data Tables **
+- `match_metadata`: (match_id TEXT, competition_name TEXT, home_team_name TEXT, away_team_name TEXT, pitch_length_m FLOAT, pitch_width_m FLOAT)
+- `tracking_data`: (match_id TEXT, period INT, frame INT, timestamp_iso TIMESTAMPTZ, tracked_objects JSONB, frame_metadata JSONB)
+- `players`: (match_id TEXT, trackable_object TEXT, team_id INTEGER, team_name TEXT, first_name TEXT, last_name TEXT, "number" INT, player_role TEXT)
+    - **Note:** This table is the definitive source for linking a player to a team via the `team_name` column.
 
 You will be given the failed query and a list of errors. Your output must be ONLY the corrected SQL query wrapped in ```sql ... ```.
 """
@@ -186,37 +270,61 @@ Common Errors to Fix:
 
 function round(double precision, integer) does not exist: Fix by casting the value to NUMERIC.
 invalid reference to FROM-clause entry: Fix by using explicit JOIN syntax (CROSS JOIN LATERAL).
+- **`operator does not exist: typeA = typeB`**: This is a data type mismatch. The most common cause is an incorrect cast (`::INT`, `::NUMERIC`). The fix is usually to **remove the cast** or **cast both sides of the comparison to the same type** (e.g., `CAST(column_a AS TEXT) = CAST(column_b AS TEXT)`).
 Your output must be ONLY the corrected SQL query wrapped in sql ... .
 """
+
 FINAL_SYNTHESIS_PROMPT = """
-You are the final review layer of a sports data AI. Your task is to review the entire analytical process and formulate a user-facing response.
-Evaluate the result and provide a confidence score.
-You will be given the user's query, the final SQL, and the raw data result.
-Generate a single JSON object.
+You are the final review layer of a sports data AI. Your primary task is to synthesize the raw data from a query into a clear, insightful, and user-friendly response.
+Review the user's query and the final data, then generate a single JSON object.
+
+**Guiding Principles for Your Response:**
+1.  **Synthesize, Don't Just Report:** Your `answer` should provide a concise, natural language summary of the key insights from the data. Don't just list the numbers.
+2.  **Present Data Intelligently:** Your goal is to choose the best possible format to convey the information. A single number can be in the text, but more complex data should be visualized.
+3.  **Confidence is Key:** Use the `confidence_score` and `explanation_for_low_confidence` to be transparent about the quality and limitations of the analysis.
+
+**Data Visualization Principles:**
+- **When to Visualize:** You should recommend a visualization if the data tells a story that is better seen than read. A good trigger for this is when the data represents a trend, comparison, or distribution.
+- **Choosing the Right Chart:**
+    - **`line_chart`:** Ideal for showing a trend over time. If the data has a timestamp, time bin, or sequential game minute and a corresponding numeric value, a line chart is almost always the best choice. For multiple metrics over time (e.g., length and width), use a multi-line chart.
+    - **`bar_chart`:** Best for comparing distinct categories (e.g., comparing total passes for 5 different players).
+    - **`scatter_plot`:** Use this for showing the relationship between two different numeric variables (e.g., plotting shot xG vs. shot speed).
+- **Formatting for Charts:** When you recommend a chart, format the `data` key as an array of objects. For time-series, this should be `[{ "x": "time_value", "y": numeric_value }, ...]`.
+- **Default Behavior:** If a visualization is not appropriate for the data (e.g., it's just one or two data points), the `visualization.type` should be the string `'none'`.
+
+**Generate a single JSON object with the following structure:**
 {
   "confidence_score": <An integer between 0 and 100>,
-  "answer": "<A concise, natural language summary of the data result for the user.",
+  "answer": "<Your concise, natural language summary of the insights.>",
+  "visualization": {
+    "type": "<'line_chart', 'scatter_plot', 'bar_chart', or 'none'>",
+    "data": <Data formatted for the chart, or null if type is 'none'>,
+    "options": {
+      "title": "<A descriptive title for the chart, or null if type is 'none'>",
+      "xAxisLabel": "<A label for the X-axis, or null if type is 'none'>",
+      "yAxisLabel": "<A label for the Y-axis, or null if type is 'none'>"
+    }
+  },
   "explanation_for_low_confidence": {
-    "reason": "<If confidence is below 70, explain the primary reason. E.g., 'The query returned no data.'>",
-    "limitations": "<If confidence is below 70, explain the limitations. E.g., 'This only considers the first half.'>",
-    "request_for_more_info": "<If confidence is below 70, ask a clarifying question. E.g., 'Would you like to broaden the search criteria?'>"
+    "reason": "<If confidence is below 70, explain the primary reason.>",
+    "limitations": "<If confidence is below 70, explain the limitations.>",
+    "request_for_more_info": "<If confidence is below 70, ask a clarifying question.>"
   }
 }
-Confidence Score Guide:
-
-90-100%: Specific query, direct SQL, concrete non-empty data returned.
-70-89%: Mostly answered, but assumptions were made or data was sparse.
-Below 70%: Returned no results, request was ambiguous, or data was insufficient. You MUST fill out the explanation.
 """
 # --- The Main Conversational Agent Function ---
-def run_conversational_agent(user_query: str, chat_history: List[Dict]):
+def run_conversational_agent(user_query: str, chat_history: List[Dict], last_data: List[Dict] = None):
     print(f"\nAGENT: Received query: '{user_query}'")
     main_model = genai.GenerativeModel(model_name="gemini-2.5-pro")
     validator_model = genai.GenerativeModel(model_name="gemini-2.5-pro")
 
+    formatted_history = format_history_for_prompt(chat_history)
+    formatted_last_data = format_data_for_prompt(last_data)
+
     # --- NEW STAGE 1: PLANNING AND CRITIQUE LOOP ---
     MAX_PLANNING_ATTEMPTS = 4
     plan = None
+    critique = {}
     for attempt in range(MAX_PLANNING_ATTEMPTS):
         print(f"AGENT: Planning attempt #{attempt + 1}...")
 
@@ -226,7 +334,8 @@ def run_conversational_agent(user_query: str, chat_history: List[Dict]):
         decomposition_prompt = (
             f"{ANALYST_CONSTITUTION_PROMPT}\n\n"
             f"**SCHEMA AND CONVENTIONS DOCUMENT:**\n{DB_SCHEMA_AND_ANALYTICAL_CONVENTIONS}\n\n"
-            f"{history_for_planner}\n\n"
+            f"{formatted_history}\n"
+            f"{formatted_last_data}\n"
             f"User Query: \"{user_query}\"\n\nProduce the complete analytical plan now."
         )
         response = main_model.generate_content(decomposition_prompt)
@@ -266,11 +375,17 @@ def run_conversational_agent(user_query: str, chat_history: List[Dict]):
     # After the loop, check if we ever got a valid plan
     if not plan or not critique.get("is_plan_robust"):
         return {"conversational_response": f"I'm sorry, I was unable to create a robust plan after multiple attempts. The final issue was: {critique.get('critique', 'Unknown planning error.')}", "data": None, "updated_history": chat_history}
-
+    # --- NEW: Check for NO_OP action from the planner ---
+    if plan.get("final_select_details", {}).get("action") == "NO_OP":
+        print("AGENT: Planner determined a new query is not needed. Using cached data.")
+        tool_result = last_data
+        final_query = "-- NO_OP: Answered from cached data from the previous turn --"
+    else:
     # Now extract the final, approved plan details
-    steps = plan['steps']
-    final_select_details = plan['final_select_details']
-    print(f"AGENT: Final plan approved. Explanation: {plan['explanation']}")
+        steps = plan['steps']
+        final_select_details = plan['final_select_details']
+        print(f"AGENT: Final plan approved. Explanation: {plan['explanation']}")
+        
     # STAGE 2: QUERY CONSTRUCTION
     final_query = ""
     full_cte_query = "WITH\n"

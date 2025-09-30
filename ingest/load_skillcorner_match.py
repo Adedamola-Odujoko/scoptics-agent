@@ -1,3 +1,14 @@
+"""
+This script handles the ingestion of a single match from the SkillCorner open data
+repository into the database. It performs the following steps:
+1.  Connects to the PostgreSQL database using credentials from a .env file.
+2.  Cleans any pre-existing data for the given match_id to ensure idempotency.
+3.  Loads the match_data.json and structured_data.json files.
+4.  Ingests match metadata (teams, competition, pitch size).
+5.  Ingests the full player roster, enriching it with team_id and team_name.
+6.  Transforms and validates the raw tracking data using Pydantic models.
+7.  Bulk-inserts the validated tracking data into the `tracking_data` table.
+"""
 import os
 import sys
 import json
@@ -33,7 +44,7 @@ def parse_time_string(time_str: str) -> timedelta:
 def load_skillcorner_match(skillcorner_repo_path: str, match_id: int):
     """
     Loads all data for a given match from the SkillCorner open data repository
-    into the database, including match metadata, player roster, and tracking data.
+    into the database, including metadata, an enriched player roster, and tracking data.
     """
     print("="*60)
     print(f"Starting SkillCorner ingestion for Match ID: {match_id}")
@@ -64,8 +75,25 @@ def load_skillcorner_match(skillcorner_repo_path: str, match_id: int):
         # --- 3. Clean Existing Data (Idempotency) ---
         print("Clearing any existing data for this match...")
         connection.execute(text("DELETE FROM tracking_data WHERE match_id = :match_id"), {'match_id': str(match_id)})
-        connection.execute(text("DELETE FROM players WHERE match_id = :match_id"), {'match_id': str(match_id)})
+        # Drop the players table completely to recreate it with the correct schema
+        connection.execute(text("DROP TABLE IF EXISTS players CASCADE;"))
         connection.execute(text("DELETE FROM match_metadata WHERE match_id = :match_id"), {'match_id': str(match_id)})
+
+        # --- NEW: Create the players table with the definitive, enriched schema ---
+        print("Creating the players table with the new schema...")
+        connection.execute(text("""
+            CREATE TABLE players (
+                match_id TEXT,
+                trackable_object TEXT,
+                team_id INTEGER,
+                team_name TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                "number" INTEGER,
+                player_role TEXT,
+                PRIMARY KEY (match_id, trackable_object)
+            );
+        """))
         
         # --- 4. Ingest Match Metadata ---
         print("Processing and inserting match metadata...")
@@ -84,16 +112,28 @@ def load_skillcorner_match(skillcorner_repo_path: str, match_id: int):
             VALUES (:match_id, :competition_name, :home_team_name, :away_team_name, :pitch_length_m, :pitch_width_m)
         """), [metadata_to_insert])
 
-        # --- 5. Ingest Player Roster (THE CRITICAL NEW STEP) ---
-        print("Processing and inserting player metadata...")
+        # --- 5. Ingest Player Roster (CORRECTED AND ENRICHED) ---
+        print("Processing and inserting player metadata with team information...")
+        
+        # Create a mapping from team ID to team name for easy lookup
+        home_team_id = meta_data.get('home_team', {}).get('id')
+        away_team_id = meta_data.get('away_team', {}).get('id')
+        team_id_map = {
+            home_team_id: metadata_to_insert['home_team_name'],
+            away_team_id: metadata_to_insert['away_team_name']
+        }
+
         players_to_insert = []
         for player_data in meta_data.get('players', []):
             try:
-                # Ensure the core identifier is present
-                if 'trackable_object' in player_data:
+                # Ensure the core identifiers for a valid player are present
+                if 'trackable_object' in player_data and 'team_id' in player_data:
+                    player_team_id = player_data.get('team_id')
                     players_to_insert.append({
                         "match_id": str(match_id),
                         "trackable_object": str(player_data['trackable_object']),
+                        "team_id": player_team_id,
+                        "team_name": team_id_map.get(player_team_id), # Add team name from our map
                         "first_name": player_data.get('first_name'),
                         "last_name": player_data.get('last_name'),
                         "number": player_data.get('number'),
@@ -105,11 +145,11 @@ def load_skillcorner_match(skillcorner_repo_path: str, match_id: int):
         
         if players_to_insert:
             ins_player_query = text("""
-                INSERT INTO players (match_id, trackable_object, first_name, last_name, "number", player_role)
-                VALUES (:match_id, :trackable_object, :first_name, :last_name, :number, :player_role)
+                INSERT INTO players (match_id, trackable_object, team_id, team_name, first_name, last_name, "number", player_role)
+                VALUES (:match_id, :trackable_object, :team_id, :team_name, :first_name, :last_name, :number, :player_role)
             """)
             connection.execute(ins_player_query, players_to_insert)
-            print(f"Successfully inserted {len(players_to_insert)} player records.")
+            print(f"Successfully inserted {len(players_to_insert)} player records with team info.")
 
         connection.commit()
 
@@ -120,14 +160,12 @@ def load_skillcorner_match(skillcorner_repo_path: str, match_id: int):
 
     for frame_data in tracking_frames_raw:
         try:
-            # Basic validation for required fields
             if frame_data.get('time') is None or frame_data.get('period') is None:
                 continue
 
             time_delta = parse_time_string(frame_data['time'])
             frame_datetime = base_date + time_delta
             
-            # Use Pydantic models for validation and structure
             frame_model = TrackingFrame(
                 match_id=str(match_id),
                 period=frame_data['period'],
@@ -149,7 +187,6 @@ def load_skillcorner_match(skillcorner_repo_path: str, match_id: int):
     print(f"Preparing to insert {len(records_to_insert)} valid frame records into 'tracking_data'...")
     with engine.connect() as connection:
         for record in records_to_insert:
-            # Serialize JSON columns to strings for the database driver
             record['tracked_objects'] = json.dumps(record['tracked_objects'])
             record['frame_metadata'] = json.dumps(record['frame_metadata'])
         
