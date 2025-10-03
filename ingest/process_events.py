@@ -504,7 +504,20 @@ def process_all_events(match_id_str: str, engine):
         print(f"  -> CRITICAL ERROR: Could not load metadata. Aborting. Error: {e}"); return
 
     print("  -> Loading all tracking data into memory...")
-    sql = text(f"SELECT t.match_id, t.frame, t.period, t.timestamp_iso, (p.obj ->> 'trackable_object') as trackable_object, (p.obj ->> 'x')::FLOAT as x, (p.obj ->> 'y')::FLOAT as y FROM tracking_data t, LATERAL jsonb_array_elements(t.tracked_objects) p(obj) WHERE t.match_id = '{match_id_str}' AND (p.obj ->> 'trackable_object') IS NOT NULL")
+    sql = text(f"""
+        SELECT
+            match_id,
+            frame,
+            period,
+            timestamp_iso,
+            trackable_object,
+            x,
+            y
+        FROM
+            tracking_data_centered
+        WHERE
+            match_id = '{match_id_str}'
+    """)
     df_tracking = pd.read_sql(sql, engine)
     
     # MODIFIED: Ensure the timestamp column is in datetime format for all subsequent functions
@@ -523,7 +536,6 @@ def process_all_events(match_id_str: str, engine):
     identify_shots_and_calculate_xg(df_tracking, ball_id_val, home_team_name_val, pitch_length_val, match_id_str, engine)
     
     print(f"\n--- Full Event Processing Complete for Match {match_id_str} ---")
-
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Usage: python ingest/process_events.py <match_id>")

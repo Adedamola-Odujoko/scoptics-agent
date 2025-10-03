@@ -2,6 +2,14 @@
 <html lang="en">
   <head>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/heatmap.js@2.0.2/heatmap.min.js"></script>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Scoptics AI Agent</title>
@@ -30,6 +38,7 @@
         text-align: center;
         margin-bottom: 1rem;
       }
+
       .chat-container {
         flex-grow: 1;
         border: 1px solid #e2e8f0;
@@ -101,6 +110,26 @@
       .error-message {
         color: #ef4444;
         font-weight: bold;
+      }
+      /* --- ADD THIS NEW CLASS --- */
+      .chart-container {
+        position: relative;
+        background-color: #ffffff;
+        padding: 1rem;
+        margin-top: 1rem;
+        border-radius: 6px;
+        border: 1px solid #cbd5e0;
+      }
+      /* Add this to your <style> block in index.html */
+      .heatmap-container {
+        position: relative;
+        width: 100%;
+        /* Maintain a rough pitch aspect ratio */
+        aspect-ratio: 105 / 68;
+        background-image: url("https://i.imgur.com/gPKI6pE.png"); /* A simple pitch background */
+        background-size: contain;
+        background-repeat: no-repeat;
+        background-position: center;
       }
     </style>
   </head>
